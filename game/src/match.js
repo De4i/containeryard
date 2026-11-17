@@ -1,10 +1,12 @@
-// The match: five a side, first to three rounds, and the two cranes that redraw the map between
-// them. This file owns the round clock, the objective, the bots' behaviour, and the kill feed. It
-// steps at a fixed rate and reads only the world, the fighters and the player's intent.
+// The match: the fighters, the mode's rules, the round clock and the kill feed. Four modes are run
+// here for real — team deathmatch and free-for-all are won on downs with respawns, bomb site is won
+// by planting or defusing the charge, and frontline is won by driving one contested line into the
+// enemy end. This file owns the rules, the bots' behaviour and the cranes that redraw the map.
 import * as THREE from 'three';
-import { MATCH, PALETTE, TEAMS, WEAPONS, YARD } from './config.js';
-import { createBot, placeBody, muzzlePoint, resolveSolids, clampToQuay, stepBody } from './actors.js';
+import { MATCH, MODES, PALETTE, TEAMS, WEAPONS, YARD, applyTeamNames, drawNames } from './config.js';
+import { createBot, placeBody, muzzlePoint, stepBody } from './actors.js';
 import { createEffects, hitscan, damageOf, createRocket, stepRocket } from './combat.js';
+import { applyProfile } from './economy.js';
 
 export const MATCH_PHASE = { FREEZE: 'freeze', LIVE: 'live', ROUND_OVER: 'round_over', MATCH_OVER: 'match_over' };
 
@@ -29,16 +31,35 @@ function createRandom(seed) {
   };
 }
 
-/** Everything a match needs, plus the ten bodies that fight it and five spare containers for the cranes. */
-export function createMatch({ scene, yard, player, seed, audio }) {
+/** The mode table entry for a key, defaulting to team deathmatch. */
+export function modeOf(key) {
+  return MODES.find((entry) => entry.key === key) ?? MODES[0];
+}
+
+/**
+ * Everything a match needs: the ten fighters, the names drawn for this match, the mode's rules and
+ * the state each mode carries. `profile` is the player's market profile, and its purchased numbers
+ * are written onto the player here.
+ */
+export function createMatch({ scene, yard, player, seed, audio, mode = 'bomb', profile = null }) {
   const random = createRandom(seed);
+  const drawn = drawNames(random, MATCH.teamSize);
+  applyTeamNames(drawn);
+  const rules = modeOf(mode);
   const effects = createEffects(scene);
   const rockets = [];
   const bots = [];
+  // The player takes the first callsign of the side they joined; the bots take the rest.
+  const pool = { blue: [...drawn.callsigns.blue], red: [...drawn.callsigns.red] };
+  const playerCallsign = pool[player.team].shift() ?? pool[player.team][0];
+  player.callsign = playerCallsign;
+  player.name = playerCallsign;
+  if (profile) applyProfile(player, profile);
   for (const team of ['blue', 'red']) {
     for (let index = 0; index < MATCH.teamSize; index += 1) {
-      if (team === 'blue' && index === 0) continue; // the player takes that slot
-      const bot = createBot({ ...yard, halfX: YARD.halfX, halfZ: YARD.halfZ }, team, index, random);
+      if (team === player.team && index === 0) continue; // the player takes that slot
+      const callsign = pool[team].shift() ?? `${team}-${index}`;
+      const bot = createBot({ ...yard, halfX: YARD.halfX, halfZ: YARD.halfZ }, team, index, random, callsign);
       scene.add(bot.group);
       bots.push(bot);
     }
@@ -48,14 +69,18 @@ export function createMatch({ scene, yard, player, seed, audio }) {
     scene,
     phase: MATCH_PHASE.FREEZE,
     menu: 'title',
+    rules,
+    mode: rules.key,
     round: 1,
     score: { blue: 0, red: 0 },
-    clock: MATCH.roundSeconds,
+    roundsToWin: rules.bomb ? MATCH.roundsToWin : 1,
+    clock: rules.roundSeconds,
     freeze: MATCH.freezeSeconds,
     cap: 0,
     capTeam: null,
     player,
     bots,
+    names: drawn.names,
     yard: { ...yard, halfX: YARD.halfX, halfZ: YARD.halfZ, waterY: YARD.waterY },
     effects,
     audio,
@@ -67,48 +92,93 @@ export function createMatch({ scene, yard, player, seed, audio }) {
     elapsed: 0,
     intent: { fire: false, aim: false, reload: false, pause: false, confirm: false, weapon: null, holdFire: false, holdAim: false },
     lastRoundWinner: null,
+    winner: null,
     craneSwings: 0,
     lastBotShotAt: -99,
     rockets,
+    respawns: rules.bomb ? 0 : 4.5,
+    earnings: { kills: 0, objectives: 0, roundsWon: 0 },
+    // Bomb site state: which site is live this round, whether it is planted, and the fuse.
+    bomb: { site: null, planted: false, fuse: 0, defuse: 0, carrier: null, exploded: false, defused: false },
+    fuseSeconds: 30,
+    defuseSeconds: 5,
+    // Frontline: one line at zLine, driven towards whichever end a side is standing on.
+    frontline: { z: 0, push: 0, reached: null },
     say(text, team = null) {
       match.feed.unshift({ text, team, life: 6 });
       if (match.feed.length > 7) match.feed.length = 7;
     },
     aliveCount(team) {
       const held = match.bots.filter((bot) => bot.team === team && bot.alive).length;
-      return team === 'blue' ? held + (player.alive ? 1 : 0) : held;
+      return team === match.player.team ? held + (player.alive ? 1 : 0) : held;
+    },
+    /** Who a fighter may shoot: everyone but their own side, or everyone in free-for-all. */
+    enemiesOf(actor) {
+      if (!rules.teams) return [player, ...bots].filter((other) => other !== actor);
+      return [player, ...bots].filter((other) => other.team !== actor.team);
     },
   };
 
+  pickBombSite(match);
   placeAtSpawn(match);
   return match;
 }
 
-/** Put every fighter back on its spawn line, and hand the player their rifle again. */
+/** Choose which site is live for the round, and move the objective ring and marker onto it. */
+function pickBombSite(match) {
+  const sites = match.yard.sites ?? [];
+  if (!sites.length) return;
+  const site = sites[Math.floor(match.random.next() * sites.length)];
+  match.bomb.site = site;
+  match.yard.objective = { x: site.x, y: 0, z: site.z, radius: site.radius };
+  if (match.yard.ring) match.yard.ring.position.set(site.x, 0.06, site.z);
+  if (match.yard.crate) match.yard.crate.position.set(site.x, 1.1, site.z);
+  for (const entry of sites) if (entry.marker) entry.marker.visible = entry === site || !match.rules.bomb;
+  const ringVisible = Boolean(match.rules.bomb);
+  if (match.yard.ring) match.yard.ring.visible = ringVisible;
+  if (match.yard.crate) match.yard.crate.visible = ringVisible;
+}
+
+/** Show or hide the objective dressing for the mode being played. */
+function dressForMode(match) {
+  const bombs = Boolean(match.rules.bomb);
+  if (match.yard.ring) match.yard.ring.visible = bombs;
+  if (match.yard.crate) match.yard.crate.visible = bombs;
+  for (const site of match.yard.sites ?? []) if (site.marker) site.marker.visible = bombs;
+}
+
+/** Put every fighter back on its spawn line, with the armour its profile pays for. */
 function placeAtSpawn(match) {
   const { player, bots, yard } = match;
-  const blueSpawns = yard.spawns.blue;
-  const redSpawns = yard.spawns.red;
-  player.position.set(blueSpawns[0][0], 0.9, blueSpawns[0][1]);
+  const spawns = yard.spawns;
+  const own = spawns[player.team] ?? spawns.blue;
+  player.position.set(own[0][0], 0.9, own[0][1]);
   player.velocity.set(0, 0, 0);
   player.health = 100;
-  player.armor = 100;
+  player.armorMax = player.armorMax ?? 100;
+  player.armor = player.armorMax;
   player.alive = true;
   player.ammo = player.weapon.magazine;
   player.reloading = 0;
-  player.yaw = Math.PI;
-  if (player.rig) player.rig.yaw = Math.PI;
-  let blueIndex = 1;
-  let redIndex = 0;
+  player.cooldown = 0;
+  player.respawn = 0;
+  player.yaw = player.team === 'blue' ? Math.PI : 0;
+  if (player.rig) player.rig.yaw = player.yaw;
+  // Slot zero of the player's own line belongs to the player, so their crew-mates start at one.
+  const cursor = { blue: 0, red: 0 };
+  cursor[player.team] = 1;
   for (const bot of bots) {
-    const spawn = bot.team === 'blue' ? blueSpawns[blueIndex++] : redSpawns[redIndex++];
+    const line = spawns[bot.team] ?? spawns.blue;
+    const spawn = line[cursor[bot.team]++ % line.length];
     bot.position.set(spawn[0], 0.9, spawn[1]);
     bot.velocity.set(0, 0, 0);
     bot.health = 100;
-    bot.armor = 100;
+    bot.armor = bot.armorMax ?? 100;
     bot.alive = true;
     bot.ammo = bot.weapon.magazine;
     bot.reloading = 0;
+    bot.cooldown = 0;
+    bot.respawn = 0;
     bot.target = null;
     bot.path.length = 0;
     bot.yaw = bot.team === 'blue' ? Math.PI : 0;
@@ -138,17 +208,19 @@ export function startRound(match, { shuffle = true } = {}) {
   match.round += 1;
   match.phase = MATCH_PHASE.FREEZE;
   match.freeze = MATCH.freezeSeconds;
-  match.clock = MATCH.roundSeconds;
+  match.clock = match.rules.roundSeconds;
   match.cap = 0;
   match.capTeam = null;
+  match.bomb = { site: match.bomb.site, planted: false, fuse: 0, defuse: 0, carrier: null, exploded: false, defused: false };
+  if (match.rules.bomb) pickBombSite(match);
   placeAtSpawn(match);
-  if (shuffle) swingCranes(match);
+  if (shuffle && match.rules.bomb) swingCranes(match);
   match.say(`ROUND ${match.round}: ${TEAMS.blue.name} ${match.score.blue} — ${match.score.red} ${TEAMS.red.name}`);
   match.audio?.roundStart();
   return match;
 }
 
-/** Begin the match proper, from the title screen. */
+/** Begin the match proper, from the menu. */
 export function beginMatch(match) {
   match.menu = 'playing';
   match.round = 1;
@@ -159,13 +231,29 @@ export function beginMatch(match) {
   match.shots = 0;
   match.hits = 0;
   match.feed.length = 0;
+  match.winner = null;
+  match.earnings = { kills: 0, objectives: 0, roundsWon: 0 };
   match.phase = MATCH_PHASE.FREEZE;
   match.freeze = MATCH.freezeSeconds;
-  match.clock = MATCH.roundSeconds;
+  match.clock = match.rules.roundSeconds;
+  match.frontline = { z: 0, push: 0, reached: null };
+  match.bomb = { site: match.bomb.site, planted: false, fuse: 0, defuse: 0, carrier: null, exploded: false, defused: false };
+  if (match.rules.bomb) pickBombSite(match);
+  dressForMode(match);
+  for (const bot of match.bots) bot.kills = 0;
   placeAtSpawn(match);
-  match.say('ROUND 1 — first to three rounds, five a side');
+  match.say(`${match.rules.name}: ${match.rules.blurb}`);
   match.audio?.roundStart();
   return match;
+}
+
+/** End the match for `team`, with the reason on the feed and the winner recorded. */
+function endMatch(match, team, why) {
+  match.phase = MATCH_PHASE.MATCH_OVER;
+  match.winner = team;
+  const label = team === 'blue' ? TEAMS.blue.name : team === 'red' ? TEAMS.red.name : team;
+  match.say(`${label} take the yard — ${why}`, team === 'ffa' ? null : team);
+  match.audio?.matchEnd(team === match.player.team);
 }
 
 /** End the round for `team`: the score, the feed line, and the wait before the next one. */
@@ -174,10 +262,12 @@ function endRound(match, team, why) {
   match.score[team] += 1;
   match.lastRoundWinner = team;
   match.roundOverTimer = 3.2;
+  if (team === match.player.team) match.earnings.roundsWon += 1;
   match.say(`${team === 'blue' ? TEAMS.blue.name : TEAMS.red.name} take round ${match.round} — ${why}`, team);
   match.audio?.roundEnd(team === match.player.team);
-  if (match.score[team] >= MATCH.roundsToWin) {
+  if (match.score[team] >= match.roundsToWin) {
     match.phase = MATCH_PHASE.MATCH_OVER;
+    match.winner = team;
     match.say(`${team === 'blue' ? TEAMS.blue.name : TEAMS.red.name} win the match ${match.score.blue}—${match.score.red}`, team);
     match.audio?.matchEnd(team === match.player.team);
   }
@@ -207,7 +297,28 @@ function lineClear(solids, from, to) {
   return false;
 }
 
-/** Fire a weapon for `shooter`, at `aim` direction, and put the result in the feed. */
+/** A name for the feed: the player reads as YOU, a bot as its callsign. */
+function labelOf(actor) {
+  return actor.isPlayer ? 'YOU' : actor.callsign ?? actor.name;
+}
+
+/** Kill a fighter: the tally, the feed line, and the money the player just earned. */
+function killFighter(match, victim, killer, weapon) {
+  victim.alive = false;
+  victim.deaths += 1;
+  victim.respawn = match.respawns;
+  if (!victim.isPlayer) victim.group.visible = false;
+  if (killer) {
+    killer.kills += 1;
+    if (killer.team) match.kills[killer.team] = (match.kills[killer.team] ?? 0) + 1;
+    if (killer.isPlayer) match.earnings.kills += 1;
+    match.say(`${labelOf(killer)}  [${weapon.name}]  ${labelOf(victim)}`, killer.team ?? null);
+  } else {
+    match.say(`${labelOf(victim)}  went down`, null);
+  }
+}
+
+/** Fire a weapon for `shooter`, at `aimDirection`, and put the result in the feed. */
 function shoot(match, shooter, aimDirection, origin) {
   const weapon = shooter.weapon;
   if (shooter.reloading > 0 || shooter.cooldown > 0 || shooter.ammo <= 0 || !shooter.alive) return false;
@@ -217,14 +328,16 @@ function shoot(match, shooter, aimDirection, origin) {
     shooter.ammo -= 1;
     shooter.lastShot = match.elapsed;
     if (shooter !== match.player) match.lastBotShotAt = match.elapsed;
-    match.rockets.push({ owner: shooter, rocket: createRocket(match.scene, origin, aimDirection) });
-    match.effects.addFlash(origin, shooter.rig ? shooter.rig.yaw : shooter.yaw, 1.6);
+    match.rockets.push({ owner: shooter, rocket: createRocket(match.scene, origin, aimDirection), origin: origin.clone() });
+    // The launcher's flash sits out along the tube and stays modest, for the same reason as a rifle's.
+    const launchFlash = origin.clone().addScaledVector(aimDirection, 1.6);
+    match.effects.addFlash(launchFlash, shooter.rig ? shooter.rig.yaw : shooter.yaw, shooter === match.player ? 0.7 : 1.2);
     match.audio?.shot(weapon, shooter === match.player ? 0 : match.player.position.distanceTo(origin));
     return true;
   }
   // Bots shoot a little tighter than the raw table: they are trained, the player is the novice.
   const spread = weapon.spread * (shooter.spread ?? 1) * (shooter.isPlayer ? 1 : 0.55);
-  const targets = [match.player, ...match.bots].filter((actor) => actor.team !== shooter.team);
+  const targets = match.enemiesOf(shooter);
   const result = hitscan(shooter, targets, match.yard.solids, spread, match.random, origin, aimDirection);
   match.shots += 1;
   shooter.cooldown = 60 / weapon.rpm;
@@ -234,7 +347,11 @@ function shoot(match, shooter, aimDirection, origin) {
   match.effects.addTracer(origin, result.point, weapon.tracer);
   const isPlayerShooting = shooter === match.player;
   if (isPlayerShooting) {
-    match.effects.addFlash(origin, shooter.rig ? shooter.rig.yaw : 0, 1.1);
+    // The player's own flash goes out along the barrel and stays small. Placed at the muzzle — half
+    // a metre from the eye — a full-size quad covers most of the view and reads as a wash over the
+    // screen rather than as a muzzle flash.
+    const flashAt = origin.clone().addScaledVector(aimDirection, 1.5);
+    match.effects.addFlash(flashAt, shooter.rig ? shooter.rig.yaw : 0, 0.5);
     if (shooter.rig) shooter.rig.shake = Math.min(0.35, (shooter.rig.shake ?? 0) + weapon.kick * 0.06);
   } else {
     match.effects.addFlash(origin, shooter.yaw, 0.9);
@@ -242,7 +359,8 @@ function shoot(match, shooter, aimDirection, origin) {
   const heard = match.player.position.distanceTo(origin);
   match.audio?.shot(weapon, isPlayerShooting ? 0 : heard);
   if (result.target) {
-    const damage = damageOf(weapon, result.body);
+    // The barrel work bought in the market scales the damage the table hands out.
+    const damage = Math.round(damageOf(weapon, result.body) * (shooter.damageScale ?? 1));
     // Armour takes half of every hit until it runs out: a vest buys time, not immunity.
     const absorbed = Math.min(result.target.armor, Math.round(damage * 0.5));
     result.target.armor -= absorbed;
@@ -264,16 +382,11 @@ function shoot(match, shooter, aimDirection, origin) {
         }
       }
     }
-    if (result.target.health <= 0) {
-      result.target.alive = false;
-      result.target.deaths += 1;
-      shooter.kills += 1;
-      match.kills[shooter.team] += 1;
-      const killerName = isPlayerShooting ? 'YOU' : shooter.name;
-      match.say(`${killerName}  [${weapon.name}]  ${result.target.isPlayer ? 'YOU' : result.target.name}`, shooter.team);
-      if (!result.target.isPlayer) result.target.group.visible = false;
-    }
-  } else {
+    if (result.target.health <= 0) killFighter(match, result.target, shooter, weapon);
+  } else if (result.solid) {
+    // An impact belongs to a shot that met the world. A round that flew out over the water and hit
+    // nothing must leave nothing: the old branch spawned a spark at the end of its range, which hung
+    // in mid-air above the quay and read as a floating block on screen.
     match.effects.addSpark(result.point);
     match.audio?.impact();
   }
@@ -282,8 +395,8 @@ function shoot(match, shooter, aimDirection, origin) {
 
 /** One bot's thinking: find a target, close the distance, shoot, and keep moving. */
 function stepBot(match, bot, dt) {
-  const { player, bots, yard } = match;
-  const enemies = [player, ...bots].filter((actor) => actor.team !== bot.team && actor.alive);
+  const { yard } = match;
+  const enemies = match.enemiesOf(bot).filter((actor) => actor.alive);
   bot.think -= dt;
   if (bot.think <= 0) {
     bot.think = 0.18 + match.random.next() * 0.12;
@@ -303,7 +416,17 @@ function stepBot(match, bot, dt) {
       bot.strafeTimer = 0.5 + match.random.next() * 1.4;
     }
   }
-  const goal = bot.target ? bot.target.position : new THREE.Vector3(yard.objective.x, 0.9, yard.objective.z);
+  // Where a bot wants to be when it has no target depends on the mode: the bomb site, the line, or
+  // simply the nearest enemy. This is what makes each mode play differently rather than just score
+  // differently.
+  let goal = new THREE.Vector3(yard.objective.x, 0.9, yard.objective.z);
+  if (match.rules.frontline) goal = new THREE.Vector3((bot.team === 'blue' ? -1 : 1) * 8, 0.9, match.frontline.z);
+  else if (!match.rules.bomb) {
+    // Deathmatch: with nothing to take, a bot with no target walks into the enemy half to find one.
+    const push = bot.team === 'blue' ? 1 : -1;
+    goal = new THREE.Vector3(bot.position.x * 0.4, 0.9, push * yard.halfZ * 0.55);
+  }
+  if (bot.target) goal = bot.target.position;
   const toGoal = new THREE.Vector3(goal.x - bot.position.x, 0, goal.z - bot.position.z);
   const distance = toGoal.length();
   const facing = Math.atan2(-toGoal.x, -toGoal.z);
@@ -358,6 +481,7 @@ function stepBot(match, bot, dt) {
 /** The player's own trigger, reload and weapon switching. */
 function stepPlayerWeapon(match, dt) {
   const { player, intent } = match;
+  if (!player.alive) return;
   player.cooldown = Math.max(0, player.cooldown - dt);
   player.lastShot += dt;
   if (player.reloading > 0) {
@@ -374,11 +498,17 @@ function stepPlayerWeapon(match, dt) {
     return;
   }
   if (intent.weapon !== null && intent.weapon !== undefined) {
-    player.weaponIndex = intent.weapon % WEAPONS.length;
-    player.weapon = WEAPONS[player.weaponIndex];
-    player.ammo = player.weapon.magazine;
-    player.reloading = 0;
-    match.say(`You take the ${player.weapon.name}`);
+    const owned = player.profile?.owned ?? WEAPONS.map((entry) => entry.key);
+    const wanted = WEAPONS[intent.weapon % WEAPONS.length];
+    if (owned.includes(wanted.key)) {
+      player.weaponIndex = intent.weapon % WEAPONS.length;
+      player.weapon = wanted;
+      player.ammo = player.weapon.magazine;
+      player.reloading = 0;
+      match.say(`You take the ${player.weapon.name}`);
+    } else {
+      match.say(`${wanted.name} is not in your loadout — buy it in the market`);
+    }
     intent.weapon = null;
   }
   const wantsFire = intent.holdFire || intent.fire;
@@ -404,6 +534,123 @@ function stepPlayerWeapon(match, dt) {
   intent.fire = false;
 }
 
+/** Bring a dead fighter back, in the modes that use respawns. */
+function stepRespawns(match, dt) {
+  if (!match.respawns) return;
+  for (const actor of [match.player, ...match.bots]) {
+    if (actor.alive || actor.respawn <= 0) continue;
+    actor.respawn -= dt;
+    if (actor.respawn > 0) continue;
+    const spawns = match.yard.spawns[actor.team] ?? match.yard.spawns.blue;
+    const spawn = spawns[Math.floor(match.random.next() * spawns.length)];
+    actor.position.set(spawn[0], 0.9, spawn[1]);
+    actor.velocity.set(0, 0, 0);
+    actor.health = 100;
+    actor.armor = actor.armorMax ?? 100;
+    actor.alive = true;
+    actor.ammo = actor.weapon.magazine;
+    actor.reloading = 0;
+    actor.respawn = 0;
+    if (!actor.isPlayer) {
+      actor.group.visible = true;
+      placeBody(actor.body, actor.position, actor.yaw, false);
+    }
+  }
+}
+
+/** Team deathmatch and free-for-all: the first side, or fighter, to the kill target takes it. */
+function stepKillTarget(match) {
+  const target = match.rules.winKills;
+  if (!target) return false;
+  if (!match.rules.teams) {
+    const leaders = [match.player, ...match.bots].slice().sort((a, b) => b.kills - a.kills);
+    const top = leaders[0];
+    if (top && top.kills >= target) {
+      endMatch(match, top.isPlayer ? match.player.team : top.team, `${labelOf(top)} reached ${target} downs`);
+      return true;
+    }
+    return false;
+  }
+  for (const team of ['blue', 'red']) {
+    const downs = match.bots.filter((bot) => bot.team === team).reduce((sum, bot) => sum + bot.kills, 0)
+      + (team === match.player.team ? match.player.kills : 0);
+    const total = (match.kills[team] ?? 0);
+    if (downs >= target || total >= target) {
+      endMatch(match, team, `${target} downs`);
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Bomb site: plant, hold the fuse, defuse, or clear the other crew. */
+function stepBomb(match, dt) {
+  const bomb = match.bomb;
+  const site = bomb.site;
+  if (!site) return;
+  const inSite = (actor) => actor.alive
+    && Math.hypot(actor.position.x - site.x, actor.position.z - site.z) < site.radius;
+  if (!bomb.planted) {
+    const attackers = match.player.team === 'blue'
+      ? [match.player, ...match.bots.filter((bot) => bot.team === 'blue')]
+      : match.bots.filter((bot) => bot.team === 'red');
+    const onSite = attackers.filter(inSite).length;
+    if (onSite > 0) {
+      match.capTeam = 'blue';
+      match.cap += (dt / MATCH.capSeconds) * onSite;
+      if (match.cap >= 1) {
+        bomb.planted = true;
+        bomb.fuse = match.fuseSeconds;
+        match.earnings.objectives += 1;
+        match.say(`${TEAMS.blue.name} plant the charge at ${site.label ?? site.key}`, 'blue');
+        match.audio?.roundStart();
+      }
+    } else {
+      match.cap = Math.max(0, match.cap - dt * 0.35);
+      match.capTeam = null;
+    }
+    return;
+  }
+  // Planted: the fuse runs, and the other crew can cut it by standing on the charge.
+  const defenders = match.player.team === 'red'
+    ? [match.player, ...match.bots.filter((bot) => bot.team === 'red')]
+    : match.bots.filter((bot) => bot.team === 'red');
+  const cutting = defenders.filter(inSite).length;
+  bomb.fuse -= dt;
+  if (cutting > 0) {
+    bomb.defuse += (dt / match.defuseSeconds) * cutting;
+    if (bomb.defuse >= 1) {
+      bomb.defused = true;
+      endRound(match, 'red', 'the charge was cut');
+      return;
+    }
+  }
+  if (bomb.fuse <= 0) {
+    bomb.exploded = true;
+    match.effects.addSpark(new THREE.Vector3(site.x, 1.4, site.z), new THREE.Vector3(0, 1, 0), '#ffb066', 60);
+    match.audio?.matchEnd(true);
+    endRound(match, 'blue', 'the charge went off');
+  }
+}
+
+/** Frontline: one line, and whoever stands on it drives it into the other end. */
+function stepFrontline(match, dt) {
+  const line = match.frontline;
+  const near = (actor) => actor.alive && Math.abs(actor.position.z - line.z) < 6;
+  const bluePush = (match.player.alive && match.player.team === 'blue' && near(match.player) ? 1 : 0)
+    + match.bots.filter((bot) => bot.team === 'blue' && near(bot)).length;
+  const redPush = match.bots.filter((bot) => bot.team === 'red' && near(bot)).length;
+  const net = bluePush - redPush;
+  line.push = net;
+  line.z += net * dt * 0.55;
+  line.z = Math.max(-match.yard.halfZ + 3, Math.min(match.yard.halfZ - 3, line.z));
+  match.cap = Math.min(1, Math.abs(line.z) / (match.yard.halfZ - 3));
+  match.capTeam = line.z < 0 ? 'blue' : 'red';
+  if (Math.abs(line.z) >= match.yard.halfZ - 3.5) {
+    endMatch(match, line.z < 0 ? 'blue' : 'red', 'the line was driven home');
+  }
+}
+
 /** Advance the whole match one fixed step. */
 export function stepMatch(match, dt, input) {
   match.elapsed += dt;
@@ -417,21 +664,14 @@ export function stepMatch(match, dt, input) {
     match.effects.addSpark(at.clone(), new THREE.Vector3(0, 1, 0), null, 18);
     match.audio?.impact();
     for (const actor of [match.player, ...match.bots]) {
-      if (!actor.alive || actor.team === entry.owner.team) continue;
+      if (!actor.alive || match.enemiesOf(entry.owner).indexOf(actor) === -1) continue;
       const distance = actor.position.distanceTo(at);
       if (distance > 7) continue;
-      const damage = Math.round(entry.owner.weapon.damage * (1 - distance / 7));
+      const damage = Math.round(entry.owner.weapon.damage * (1 - distance / 7) * (entry.owner.damageScale ?? 1));
       const soaked = Math.min(actor.armor, Math.round(damage * 0.5));
       actor.armor -= soaked;
       actor.health -= damage - soaked;
-      if (actor.health <= 0) {
-        actor.alive = false;
-        actor.deaths += 1;
-        entry.owner.kills += 1;
-        match.kills[entry.owner.team] += 1;
-        if (!actor.isPlayer) actor.group.visible = false;
-        match.say(`${entry.owner === match.player ? 'YOU' : entry.owner.name}  [${entry.owner.weapon.name}]  ${actor.isPlayer ? 'YOU' : actor.name}`, entry.owner.team);
-      }
+      if (actor.health <= 0) killFighter(match, actor, entry.owner, entry.owner.weapon);
     }
     match.scene.remove(entry.rocket.group);
     match.rockets.splice(index, 1);
@@ -464,37 +704,32 @@ export function stepMatch(match, dt, input) {
   }
 
   match.clock = Math.max(0, match.clock - dt);
+  if (match.rules.bomb && match.bomb.planted) match.clock = Math.max(match.clock, match.bomb.fuse);
   stepPlayerWeapon(match, dt);
   for (const bot of match.bots) {
     if (bot.alive) stepBot(match, bot, dt);
   }
+  stepRespawns(match, dt);
 
-  // The objective: standing in the ring loads the manifest. One side at a time.
-  const onPoint = [];
-  if (match.player.alive && Math.hypot(match.player.position.x - match.yard.objective.x, match.player.position.z - match.yard.objective.z) < match.yard.objective.radius) onPoint.push('blue');
-  for (const bot of match.bots) {
-    if (!bot.alive) continue;
-    if (Math.hypot(bot.position.x - match.yard.objective.x, bot.position.z - match.yard.objective.z) < match.yard.objective.radius) onPoint.push(bot.team);
+  // The rules of the mode being played, one branch each, so a mode is a rule not a skin.
+  if (match.rules.bomb) {
+    stepBomb(match, dt);
+    if (match.phase !== MATCH_PHASE.LIVE) return match;
+    if (match.aliveCount('red') === 0) endRound(match, 'blue', 'the site was cleared');
+    else if (match.aliveCount('blue') === 0) endRound(match, 'red', 'the attack was held');
+    else if (match.clock <= 0 && !match.bomb.planted) endRound(match, 'red', 'the clock ran out');
+    return match;
   }
-  const blue = onPoint.filter((team) => team === 'blue').length;
-  const red = onPoint.filter((team) => team === 'red').length;
-  if (blue > 0 && red === 0) {
-    match.capTeam = 'blue';
-    match.cap += (dt / MATCH.capSeconds) * blue;
-  } else if (red > 0 && blue === 0) {
-    match.capTeam = 'red';
-    match.cap += (dt / MATCH.capSeconds) * red;
-  } else {
-    match.cap = Math.max(0, match.cap - dt * 0.35);
-    match.capTeam = null;
+  if (match.rules.frontline) {
+    stepFrontline(match, dt);
+    return match;
   }
-
-  if (match.cap >= 1) endRound(match, match.capTeam, 'the manifest is loaded');
-  else if (match.aliveCount('red') === 0) endRound(match, 'blue', 'yard cleared');
-  else if (match.aliveCount('blue') === 0) endRound(match, 'red', 'your side is down');
-  else if (match.clock <= 0) {
-    const winner = match.aliveCount('blue') === match.aliveCount('red') ? match.capTeam : match.aliveCount('blue') > match.aliveCount('red') ? 'blue' : 'red';
-    endRound(match, winner ?? 'red', 'the clock ran out');
+  if (stepKillTarget(match)) return match;
+  if (match.clock <= 0) {
+    const blue = match.aliveCount('blue');
+    const red = match.aliveCount('red');
+    endMatch(match, blue === red ? 'blue' : blue > red ? 'blue' : 'red', 'the clock ran out');
+    return match;
   }
   match.intent.confirm = false;
   return match;

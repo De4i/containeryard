@@ -33,6 +33,7 @@ export function createPlayer(rig, yard, seed) {
   return {
     yard,
     name: 'you',
+    callsign: 'YOU',
     team: 'blue',
     isPlayer: true,
     rig,
@@ -43,6 +44,9 @@ export function createPlayer(rig, yard, seed) {
     crouching: false,
     health: 100,
     armor: 100,
+    armorMax: 100,
+    speedScale: 1,
+    damageScale: 1,
     alive: true,
     weapon: WEAPONS[0],
     weaponIndex: 0,
@@ -83,7 +87,10 @@ export function clampToQuay(position, halfX, halfZ) {
 
 /** One fixed step of a body: intent in, movement and collision out. */
 export function stepBody(body, dt, intent, yard) {
-  const speed = intent.crouch ? SPEED.crouch : intent.sprint ? SPEED.sprint : SPEED.walk;
+  const base = intent.crouch ? SPEED.crouch : intent.sprint ? SPEED.sprint : SPEED.walk;
+  // The boots a fighter bought scale every one of those speeds: the market moves the same numbers
+  // the movement code already reads, rather than adding a separate path.
+  const speed = base * (body.speedScale ?? 1);
   const yaw = body.rig ? body.rig.yaw : body.yaw;
   const sin = Math.sin(yaw);
   const cos = Math.cos(yaw);
@@ -182,13 +189,15 @@ export function createBody(teamKey, name) {
 }
 
 /** A whole bot: its body, its state, and the little memory its officer needs to behave. */
-export function createBot(yard, teamKey, index, seed) {
+export function createBot(yard, teamKey, index, seed, callsign = null) {
   const team = TEAMS[teamKey];
   const spawn = yard.spawns[teamKey][index % yard.spawns[teamKey].length];
-  const body = createBody(teamKey, `${team.key}-${index}`);
+  const name = callsign ?? team.key.toUpperCase();
+  const body = createBody(teamKey, name);
   const weapon = WEAPONS[(index + (teamKey === 'red' ? 1 : 0)) % WEAPONS.length];
   return {
-    name: `${team.key.toUpperCase()}-${index + 1}`,
+    name,
+    callsign: name,
     team: teamKey,
     isPlayer: false,
     position: new THREE.Vector3(spawn[0], 0.9, spawn[1]),
@@ -198,6 +207,9 @@ export function createBot(yard, teamKey, index, seed) {
     crouching: false,
     health: 100,
     armor: 100,
+    armorMax: 100,
+    speedScale: 1,
+    damageScale: 1,
     alive: true,
     weapon,
     ammo: weapon.magazine,

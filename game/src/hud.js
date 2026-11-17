@@ -8,14 +8,14 @@ const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const PANEL = 'rgba(9,26,32,0.66)';
 const EDGE = 'rgba(255,255,255,0.14)';
 
-/** The zones, so every panel has one owner and a fixed place. */
+/** The zones, so every panel has one owner and a fixed place: radar top-left, feed top-right. */
 const ZONE = {
-  roster: { x: 16, y: 96, width: 210 },
+  radar: { x: 16, y: 16, size: 168 },
+  roster: { x: 16, y: 228, width: 200 },
   score: { width: 380, y: 14, height: 72 },
-  feed: { x: -16, y: 96, width: 330 },
+  feed: { x: -16, y: 16, width: 340 },
   vitals: { x: 16, width: 330, height: 96 },
   weapon: { x: -16, width: 300, height: 118 },
-  radar: { size: 168, x: -16, y: -262 },
 };
 
 function panel(ctx, x, y, width, height, radius = 10) {
@@ -99,10 +99,14 @@ function crosshair(ctx, width, height, spread, marker) {
 
 /** The two crews, one block each: who is up, who is down, and what they have done. */
 function rosters(ctx, match, player) {
-  const rows = [
-    { label: TEAMS.blue.name, accent: TEAMS.blue.accent, fighters: [{ name: 'YOU', alive: player.alive, kills: player.kills }, ...match.bots.filter((bot) => bot.team === 'blue')] },
-    { label: TEAMS.red.name, accent: TEAMS.red.accent, fighters: match.bots.filter((bot) => bot.team === 'red') },
-  ];
+  const you = { name: 'YOU', callsign: 'YOU', alive: player.alive, kills: player.kills, isPlayer: true };
+  const side = (key) => match.bots.filter((bot) => bot.team === key);
+  const rows = match.rules?.teams === false
+    ? [{ label: 'FIGHTERS', accent: PALETTE.beacon, fighters: [player, ...match.bots].slice().sort((a, b) => b.kills - a.kills) }]
+    : [
+        { label: TEAMS.blue.name, accent: TEAMS.blue.accent, fighters: player.team === 'blue' ? [you, ...side('blue')] : side('blue') },
+        { label: TEAMS.red.name, accent: TEAMS.red.accent, fighters: player.team === 'red' ? [you, ...side('red')] : side('red') },
+      ];
   let y = ZONE.roster.y;
   for (const row of rows) {
     const alive = row.fighters.filter((fighter) => fighter.alive).length;
@@ -112,12 +116,21 @@ function rosters(ctx, match, player) {
     text(ctx, `${row.label}  ${alive}/${row.fighters.length}`, ZONE.roster.x + 12, y + 21, 13, row.accent, 'left', '800', ZONE.roster.width - 22);
     y += 38;
     for (const fighter of row.fighters) {
-      text(ctx, fighter.name, ZONE.roster.x + 20, y + 16, 14, fighter.alive ? '#ffffff' : 'rgba(255,255,255,0.38)', 'left', '600', 110);
+      const name = fighter.isPlayer ? 'YOU' : fighter.callsign ?? fighter.name;
+      text(ctx, name, ZONE.roster.x + 20, y + 16, 14, fighter.alive ? '#ffffff' : 'rgba(255,255,255,0.38)', 'left', '600', 110);
       text(ctx, fighter.alive ? `${fighter.kills} down` : 'out', ZONE.roster.x + ZONE.roster.width - 12, y + 16, 12, fighter.alive ? 'rgba(255,255,255,0.66)' : 'rgba(255,120,90,0.85)', 'right', '600', 92);
       y += 20;
     }
     y += 10;
   }
+}
+
+/** The wallet: what the player is carrying, and what this match has paid so far. */
+function wallet(ctx, match, player) {
+  const y = ZONE.radar.y + ZONE.radar.size + 8;
+  panel(ctx, ZONE.roster.x, y, ZONE.roster.width, 28);
+  text(ctx, `CASH $${player.profile?.cash ?? 0}`, ZONE.roster.x + 12, y + 19, 14, '#ffcf5c', 'left', '800', 100);
+  text(ctx, `+$${(match.earnings?.kills ?? 0) * 40}`, ZONE.roster.x + ZONE.roster.width - 12, y + 19, 13, 'rgba(255,255,255,0.8)', 'right', '700', 80);
 }
 
 /** The round, the clock and who is left. */
@@ -129,10 +142,17 @@ function scoreline(ctx, view, match) {
   text(ctx, `${match.score.blue}`, view.width / 2 - 30, ZONE.score.y + 56, 26, '#ffffff', 'center', '800');
   text(ctx, '—', view.width / 2, ZONE.score.y + 54, 20, 'rgba(255,255,255,0.55)', 'center');
   text(ctx, `${match.score.red}`, view.width / 2 + 30, ZONE.score.y + 56, 26, '#ffffff', 'center', '800');
-  text(ctx, `ROUND ${match.round} · FIRST TO ${MATCH.roundsToWin}`, view.width / 2, ZONE.score.y + 72, 12, 'rgba(255,255,255,0.75)', 'center', '700', ZONE.score.width - 24);
+  const target = match.rules?.winKills ? `FIRST TO ${match.rules.winKills}` : match.rules?.bomb ? `FIRST TO ${match.roundsToWin}` : match.rules?.frontline ? 'PUSH THE LINE' : '';
+  const subtitle = match.rules?.bomb
+    ? `ROUND ${match.round} · ${target}`
+    : `${match.rules?.name ?? ''}${target ? ` · ${target}` : ''}`;
+  text(ctx, subtitle, view.width / 2, ZONE.score.y + 72, 12, 'rgba(255,255,255,0.75)', 'center', '700', ZONE.score.width - 24);
   const clock = match.phase === 'freeze' ? `STARTS ${Math.ceil(match.freeze)}` : `${Math.max(0, Math.ceil(match.clock))}s`;
   text(ctx, clock, x + ZONE.score.width + 12, ZONE.score.y + 40, 20, match.clock < 20 && match.phase === 'live' ? PALETTE.beaconHot : '#ffffff', 'left', '800', 100);
-  text(ctx, `UP ${match.aliveCount('blue')} · ENEMY ${match.aliveCount('red')}`, x - 12, ZONE.score.y + 40, 14, '#ffffff', 'right', '700', 150);
+  const downs = match.rules?.teams === false
+    ? `DOWNS ${match.player.kills}`
+    : `UP ${match.aliveCount('blue')} · ENEMY ${match.aliveCount('red')}`;
+  text(ctx, downs, x - 12, ZONE.score.y + 40, 14, '#ffffff', 'right', '700', 150);
 }
 
 /** The kill feed: killer, the weapon between them, and the fighter who went down. */
@@ -155,7 +175,7 @@ function vitals(ctx, view, player) {
   text(ctx, `YOU · ${TEAMS[player.team].name}`, ZONE.vitals.x + 16, y + 24, 14, TEAMS[player.team].accent, 'left', '800', 170);
   text(ctx, player.alive ? (player.crouching ? 'CROUCHED' : player.onGround ? 'ON THE DECK' : 'IN THE AIR') : 'DOWN', ZONE.vitals.x + ZONE.vitals.width - 16, y + 24, 12, 'rgba(255,255,255,0.7)', 'right', '700', 130);
   bar(ctx, ZONE.vitals.x + 16, y + 44, ZONE.vitals.width - 32, 14, player.health / 100, player.health > 55 ? '#8fe08a' : player.health > 25 ? PALETTE.beacon : PALETTE.beaconHot, 'HEALTH', `${Math.max(0, Math.round(player.health))}`);
-  bar(ctx, ZONE.vitals.x + 16, y + 76, ZONE.vitals.width - 32, 14, player.armor / 100, '#8fd0ff', 'ARMOR', `${Math.max(0, Math.round(player.armor))}`);
+  bar(ctx, ZONE.vitals.x + 16, y + 76, ZONE.vitals.width - 32, 14, player.armor / (player.armorMax ?? 100), '#8fd0ff', 'ARMOR', `${Math.max(0, Math.round(player.armor))}`);
 }
 
 /** Which weapon, what is in it, and the seven slots. */
@@ -180,11 +200,11 @@ function weaponPanel(ctx, view, player) {
   });
 }
 
-/** The radar: the yard from above, turned with the view, above the weapon panel. */
+/** The radar: the yard from above, in the top-left corner, turned with the view. */
 function radar(ctx, view, player, match, yard) {
   const size = ZONE.radar.size;
-  const x = view.width + ZONE.radar.x - size;
-  const y = view.height + ZONE.radar.y;
+  const x = ZONE.radar.x;
+  const y = ZONE.radar.y;
   panel(ctx, x, y, size, size, 10);
   text(ctx, 'YARD', x + 10, y + 17, 11, 'rgba(255,255,255,0.7)', 'left', '800');
   const cx = x + size / 2;
@@ -211,9 +231,17 @@ function radar(ctx, view, player, match, yard) {
   ctx.beginPath();
   ctx.arc((yard.objective.x - player.position.x) * scale, (yard.objective.z - player.position.z) * scale, yard.objective.radius * scale, 0, Math.PI * 2);
   ctx.stroke();
+  if (match.rules?.frontline) {
+    ctx.strokeStyle = '#ff8a5a';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-size, (match.frontline.z - player.position.z) * scale);
+    ctx.lineTo(size, (match.frontline.z - player.position.z) * scale);
+    ctx.stroke();
+  }
   for (const bot of match.bots) {
     if (!bot.alive) continue;
-    const friend = bot.team === player.team;
+    const friend = match.rules?.teams !== false && bot.team === player.team;
     ctx.fillStyle = friend ? TEAMS.blue.accent : TEAMS.red.accent;
     ctx.beginPath();
     ctx.arc((bot.position.x - player.position.x) * scale, (bot.position.z - player.position.z) * scale, friend ? 3 : 3.6, 0, Math.PI * 2);
@@ -235,12 +263,39 @@ export function drawHud(ctx, player, match, yard) {
   crosshair(ctx, view.width, view.height, (spreads[player.weapon.key] ?? 0.02) * (player.crouching ? 0.6 : 1), match.effects.markerStrength);
   scoreline(ctx, view, match);
   rosters(ctx, match, player);
+  wallet(ctx, match, player);
   killFeed(ctx, view, match);
   vitals(ctx, view, player);
   weaponPanel(ctx, view, player);
   radar(ctx, view, player, match, yard);
 
-  if (match.cap > 0.02) {
+  if (match.rules?.bomb) {
+    // The charge: planting progress, then the fuse the defending crew has to cut.
+    const width = 260;
+    const x = view.width / 2 - width / 2;
+    const y = view.height / 2 + 58;
+    const bomb = match.bomb ?? {};
+    if (!bomb.planted && match.cap > 0.02) {
+      panel(ctx, x, y, width, 26, 6);
+      ctx.fillStyle = TEAMS.blue.accent;
+      ctx.fillRect(x + 6, y + 14, (width - 12) * Math.min(1, match.cap), 8);
+      text(ctx, `PLANTING AT ${bomb.site?.label ?? ''}`, view.width / 2, y + 12, 11, 'rgba(255,255,255,0.92)', 'center', '800', width - 12);
+    } else if (bomb.planted) {
+      panel(ctx, x, y, width, 30, 6);
+      text(ctx, `CHARGE ARMED — ${Math.max(0, Math.ceil(bomb.fuse))}s`, view.width / 2, y + 14, 12, PALETTE.beaconHot, 'center', '800', width - 12);
+      ctx.fillStyle = bomb.defuse > 0 ? '#8fe08a' : 'rgba(255,255,255,0.25)';
+      ctx.fillRect(x + 6, y + 19, (width - 12) * Math.min(1, bomb.defuse), 5);
+    }
+  } else if (match.rules?.frontline) {
+    const width = 300;
+    const x = view.width / 2 - width / 2;
+    const y = view.height / 2 + 58;
+    panel(ctx, x, y, width, 26, 6);
+    const share = Math.min(1, Math.abs(match.frontline.z) / (match.yard.halfZ - 3));
+    ctx.fillStyle = match.frontline.z < 0 ? TEAMS.blue.accent : TEAMS.red.accent;
+    ctx.fillRect(x + 6, y + 14, (width - 12) * share, 8);
+    text(ctx, `FRONTLINE ${match.frontline.push > 0 ? 'ADVANCING' : match.frontline.push < 0 ? 'FALLING BACK' : 'HELD'}`, view.width / 2, y + 12, 11, 'rgba(255,255,255,0.92)', 'center', '800', width - 12);
+  } else if (match.cap > 0.02) {
     const width = 220;
     const x = view.width / 2 - width / 2;
     const y = view.height / 2 + 58;

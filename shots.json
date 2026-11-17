@@ -1,5 +1,6 @@
 [
-  { "name": "1-start.jpg", "query": "?shot=start&seed=1" },
-  { "name": "2-play.jpg", "query": "?shot=play&seed=1" },
-  { "name": "3-end.jpg", "query": "?shot=end&seed=1" }
+  { "name": "1-firefight.jpg", "query": "?shot=firefight&seed=7&map=depot", "scene": "a live firefight: the launcher's rocket in the air, five enemies in the open, radar top-left, kill feed top-right" },
+  { "name": "2-briefing.jpg", "query": "?shot=briefing&mode=bomb&map=depot", "scene": "the briefing: four modes, the crew you fight for, and three maps on one screen" },
+  { "name": "3-market.jpg", "query": "?shot=market", "scene": "the yard market, spending the cash a won match paid on armour, attributes and weapons" },
+  { "name": "4-result.jpg", "query": "?shot=result", "scene": "the end of a won match: the winning crew, rounds, downs and losses, and the cash earned with its breakdown" }
 ]

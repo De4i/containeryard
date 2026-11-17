@@ -67,6 +67,16 @@ export function createInput(canvas) {
       look.dx = 0;
       look.dy = 0;
     },
+    /** The presses since the last call, for the screens that navigate rather than fight. */
+    takeTaps() {
+      const out = taps.slice();
+      taps.length = 0;
+      return out;
+    },
+    /** Whether a key is down right now, for held menu actions. */
+    isHeld(code) {
+      return held.has(code);
+    },
     /**
      * Turn this frame's presses into the match's own intents: fire, aim, reload, pause and the
      * weapon slots. Called once per frame, before the fixed steps run.

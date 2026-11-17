@@ -1,19 +1,20 @@
-// A tiny static server for game/ (Node 22, standard library only), so an entry can be played
-// locally without a build step: `node serve.ts` serves game/ on http://localhost:8080.
-// It sends the MIME types a browser game needs, refuses any path outside game/, and otherwise
-// does nothing clever: this is a development convenience, not a web server for the internet.
-import { createReadStream, statSync } from 'node:fs';
+// A static file server for the game, so it is played from this repository the way it will be played
+// from the grader's copy: game/ at the root of the site, no build step, no bundler, no network
+// request. Standard library only. `node serve.ts --port 8091`, then open the address it prints.
+// Types are mapped explicitly, because an ES module served as text/plain is refused by the browser.
 import { createServer } from 'node:http';
+import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
-const args = process.argv.slice(2);
-const portIndex = args.indexOf('--port');
-const requested = portIndex === -1 ? 8080 : Number(args[portIndex + 1]);
-const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 8080;
+const site = resolve(fileURLToPath(new URL('./game', import.meta.url)));
 
-const MIME: Record<string, string> = {
+const argv = process.argv.slice(2);
+const portAt = argv.indexOf('--port');
+const asked = Number(portAt === -1 ? process.env.PORT ?? 8080 : argv[portAt + 1]);
+const port = Number.isInteger(asked) && asked > 0 && asked < 65536 ? asked : 8080;
+
+const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -22,51 +23,48 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.glb': 'model/gltf-binary',
-  '.gltf': 'model/gltf+json',
-  '.bin': 'application/octet-stream',
   '.wasm': 'application/wasm',
-  '.wav': 'audio/wav',
-  '.mp3': 'audio/mpeg',
-  '.ogg': 'audio/ogg',
-  '.txt': 'text/plain; charset=utf-8',
 };
 
-createServer((request, response) => {
-  const url = new URL(request.url ?? '/', 'http://localhost');
+/** The file a request names, inside game/ and nowhere else. */
+function target(pathname: string): string | null {
+  const wanted = normalize(pathname.endsWith('/') ? `${pathname}index.html` : pathname);
+  const full = resolve(join(site, wanted));
+  if (full !== site && !full.startsWith(site + sep)) return null;
+  return full;
+}
+
+createServer(async (request, response) => {
   let pathname: string;
   try {
-    pathname = decodeURIComponent(url.pathname);
+    pathname = decodeURIComponent(new URL(request.url ?? '/', 'http://localhost').pathname);
   } catch {
     response.writeHead(400).end('bad request');
     return;
   }
-  if (pathname.endsWith('/')) pathname += 'index.html';
-  const file = resolve(join(root, normalize(pathname)));
-  if (file !== root && !file.startsWith(root + sep)) {
+  const file = target(pathname);
+  if (!file) {
     response.writeHead(403).end('forbidden');
     return;
   }
-  let size: number;
   try {
-    const stats = statSync(file);
-    if (!stats.isFile()) throw new Error('not a file');
-    size = stats.size;
+    const info = await stat(file);
+    const wanted = info.isDirectory() ? join(file, 'index.html') : file;
+    const body = await readFile(wanted);
+    response.writeHead(200, {
+      'content-type': TYPES[extname(wanted).toLowerCase()] ?? 'application/octet-stream',
+      'content-length': body.length,
+      'cache-control': 'no-store',
+    });
+    response.end(body);
   } catch {
-    response.writeHead(404).end('not found');
-    return;
+    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found');
   }
-  response.writeHead(200, {
-    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
-    'content-length': size,
-    'cache-control': 'no-store',
-  });
-  createReadStream(file).pipe(response);
 }).listen(port, '127.0.0.1', () => {
-  console.log(`game/ is on http://localhost:${port}`);
+  console.log(`CONTAINER YARD is served from ${site}`);
+  console.log(`  the game        http://localhost:${port}/`);
+  console.log(`  a staged frame  http://localhost:${port}/?shot=firefight&seed=7&map=depot`);
 });

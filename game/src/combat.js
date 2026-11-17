@@ -73,13 +73,18 @@ export function damageOf(weapon, body) {
  */
 export function createRocket(scene, from, direction, speed = 46) {
   const group = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.12, 0.62, 10), new THREE.MeshStandardMaterial({ color: 0x4a4a4a, roughness: 0.5, metalness: 0.4 }));
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.15, 0.9, 12), new THREE.MeshStandardMaterial({ color: 0x5c5c5c, roughness: 0.45, metalness: 0.4 }));
   body.rotation.x = Math.PI / 2;
   group.add(body);
-  const flare = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.6, 10), new THREE.MeshBasicMaterial({ color: 0xffb14a }));
+  // A flame big enough to read from behind: the launcher's shot has to be visible from the muzzle,
+  // and a slim cone the size of the tube is invisible at any range.
+  const flare = new THREE.Mesh(new THREE.ConeGeometry(0.3, 1.1, 12), new THREE.MeshBasicMaterial({ color: 0xffd27a }));
   flare.rotation.x = -Math.PI / 2;
-  flare.position.z = 0.5;
+  flare.position.z = 1.0;
   group.add(flare);
+  const glow = new THREE.Mesh(new THREE.SphereGeometry(0.26, 10, 8), new THREE.MeshBasicMaterial({ color: 0xfff0c0 }));
+  glow.position.z = 0.55;
+  group.add(glow);
   group.position.copy(from);
   group.lookAt(from.clone().add(direction));
   scene.add(group);
@@ -93,7 +98,7 @@ export function stepRocket(rocket, dt, solids, spark) {
   rocket.trailTimer -= dt;
   if (rocket.trailTimer <= 0) {
     rocket.trailTimer = 0.035;
-    spark(rocket.group.position, new THREE.Vector3(0, 1, 0), 0x555555, 2);
+    spark(rocket.group.position, new THREE.Vector3(0, 1, 0), 0xbfbfbf, 3);
   }
   const at = rocket.group.position;
   let hit = rocket.life <= 0 || at.y < 0.1;
